@@ -1,0 +1,69 @@
+{
+  "manifest_version": 3,
+  "name": "哆啦助手 · 30秒无水印助手",
+  "short_name": "哆啦助手助手",
+  "version": "1.6.6",
+  "description": "哆啦助手视频综合软件配套：固化 Seedance 2.5 + 30 秒请求，自动把时间码、整数秒、小数秒和中文秒数改写为全片比例。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "tabs",
+    "scripting",
+    "downloads",
+    "storage",
+    "debugger"
+  ],
+  "host_permissions": [
+    "*://*/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.doubao.com/*",
+        "*://*.dola.com/*"
+      ],
+      "js": [
+        "skill-pack-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.doubao.com/*",
+        "*://*.dola.com/*"
+      ],
+      "js": [
+        "duration-main.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.doubao.com/*",
+        "*://*.dola.com/*",
+        "*://*.qianwen.com/*",
+        "*://*.jianying.com/*"
+      ],
+      "js": [
+        "content-panel.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "哆啦助手 · 30秒无水印助手",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}

@@ -1,0 +1,56 @@
+# ==============================================================
+# 提示词管理器 - Git 忽略清单
+# 安全红线：账号凭据、号池数据、生成记录、日志、用户剧本、代理节点
+# 一律不进入版本库。
+# ==============================================================
+
+# ---- 账号与生成敏感数据（绝不入库） ----
+dola_engine/state/
+**/state/
+dola_engine/state/**
+*.dpapi
+*.sqlite3
+dola_engine/pool/
+pending_shots.json
+
+# ---- 运行日志 / 后端日志 ----
+*.log
+app.log
+app.log.err
+_backend.log
+_backend.out.log
+
+# ---- 用户本地配置与关联数据（含本机路径） ----
+added_items.json
+bad_instances.json
+asset_links.json
+asset_lib.json
+
+# ---- 用户剧本 / 素材 / 文档 ----
+测试_豪门老宅.txt
+豆啦啦独立链路体系(1).md
+dola_browser_bridge.zip
+
+# 已弃用的豆啦啦(浏览器方案)遗留源码
+dola_browser_bridge/
+README.txt
+
+# ---- 代理节点配置（含订阅 / 节点信息） ----
+dola_engine/mihomo/
+
+# ---- 内部运维 / 取号注册脚本（避免暴露滥用细节） ----
+dola_engine/_fill_pool.py
+dola_engine/_fill_pool2.py
+dola_engine/_test6.py
+dola_engine/_restore.py
+dola_engine/_take_test.py
+dola_engine/_gen_mihomo.py
+dola_engine/_gen_placeholder.py
+
+# ---- Python / 编辑器 ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
