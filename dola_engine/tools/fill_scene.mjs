@@ -60,7 +60,9 @@ try {
   if (!await evaluate(`!!document.querySelector('[data-testid="skill_input_exit_button"]')`)) {
     let clicked = false;
     for (let i = 0; i < 80 && !clicked; i++) {
-      clicked = await evaluate(`(()=>{const e=document.querySelector('[data-testid="skill_bar_button_17"]');if(!e)return false;e.click();return true})()`);
+      const point = await evaluate(`(()=>{const e=document.querySelector('[data-testid="skill_bar_button_17"]');if(!e)return null;e.scrollIntoView({block:'center',inline:'center'});const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+      if (point) { await mouseClick(point); await sleep(1200); }
+      clicked = await evaluate(`!!document.querySelector('[data-testid="skill_input_exit_button"]')`);
       if (!clicked) await sleep(500);
     }
     if (!clicked) throw new Error('Video mode button unavailable');
@@ -69,15 +71,18 @@ try {
     if (await evaluate(`!!document.querySelector('[data-testid="skill_input_exit_button"]')`)) break;
     await sleep(500);
   }
+  // 等视频输入界面完全渲染：时长触发器出现 → 页面停在「视频生成+2.5+30s」→ 扩展自动开启 30s(localStorage)。
+  await sleep(3500);
   let plugin = await evaluate(`document.documentElement.getAttribute('data-watermark-free-duration-30')`);
-  if (plugin !== '1') {
-    let clicked = false;
-    for (let i = 0; i < 80 && !clicked; i++) {
-      clicked = await evaluate(`(()=>{const e=document.getElementById('watermark-free-media-panel')?.shadowRoot?.querySelector('.duration-toggle');if(!e)return false;e.click();return true})()`);
-      if (!clicked) await sleep(500);
-    }
-    if (!clicked) throw new Error('30-second plugin switch unavailable');
+  // 30s 开关进入视频模式后通常默认已开（plugin=1）。先等待插件加载完成；
+  // 仅当确实未开且 toggle 可见时才用真实鼠标辅助点击（shadow 内 <input> 未布局时坐标为 0x0）。
+  for (let i = 0; i < 80 && plugin !== '1'; i++) {
+    const point = await evaluate(`(()=>{const e=document.getElementById('watermark-free-media-panel')?.shadowRoot?.querySelector('.duration-toggle');if(!e)return null;const r=e.getBoundingClientRect();if(r.width<1||r.height<1)return null;e.scrollIntoView({block:'center',inline:'center'});const rr=e.getBoundingClientRect();return {x:rr.x+rr.width/2,y:rr.y+rr.height/2}})()`);
+    if (point) { await mouseClick(point); await sleep(1200); }
+    plugin = await evaluate(`document.documentElement.getAttribute('data-watermark-free-duration-30')`);
+    if (plugin !== '1') await sleep(500);
   }
+  if (plugin !== '1') throw new Error('30-second plugin switch unavailable');
   let modeReady = false;
   for (let i = 0; i < 80; i++) {
     const state = await evaluate(`({href:location.href,mode:[...document.querySelectorAll('[data-testid="skill_input_exit_button"]')].some(e=>e.innerText.includes('视频生成')),buttons:[...document.querySelectorAll('button')].map(e=>e.innerText.trim()),plugin:document.documentElement.getAttribute('data-watermark-free-duration-30')})`);
