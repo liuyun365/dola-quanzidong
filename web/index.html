@@ -1177,7 +1177,7 @@ async function loadPending(){
     box.innerHTML="";
     list.slice().reverse().forEach(rec=>{
       const item=document.createElement("div"); item.className="pend-item";
-      const stMap={pending:"待收片",done:"已完成",unknown:"未成片",error:"收片异常",rejected:"被拒绝",no_30s:"无30s",cancelled:"已取消"};
+      const stMap={pending:"待收片",done:"已完成",unknown:"未成片",error:"收片异常",rejected:"被拒绝",no_30s:"无30s",cancelled:"已取消",window_closed:"窗口已关"};
       const st = rec.status || "pending";
       const r1=document.createElement("div"); r1.className="r1";
       const t=document.createElement("span"); t.textContent=(rec.series||"未命名")+" · 镜"+rec.scene_no;
@@ -1186,6 +1186,47 @@ async function loadPending(){
       const r2=document.createElement("div"); r2.className="r2";
       r2.textContent=(rec.account?("账号 "+rec.account):"")+(rec.submitted_at?(" · "+rec.submitted_at.replace("T"," ").slice(0,19)):"");
       item.appendChild(r1); item.appendChild(r2);
+      if(rec.status!=="done" && rec.status!=="cancelled"){
+        const row=document.createElement("div"); row.className="r2";
+        const mk=label=>{const b=document.createElement("button"); b.textContent=label; b.style.cssText="font-size:11px;padding:2px 8px;border:1px solid var(--accent);color:var(--accent);background:#fff;border-radius:4px;cursor:pointer;margin-right:6px;"; return b;};
+        if(rec.status==="window_closed"){
+          const rb=mk("重开窗口");
+          rb.addEventListener("click",async()=>{
+            rb.disabled=true; rb.textContent="重开中…";
+            try{
+              const r=await api("/api/dola/reopen",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:rec.run_id,scene_no:rec.scene_no})});
+              toast(r.msg||"已重开", r.ok?false:true);
+              if(r.ok) setTimeout(loadPending, 3000); else { rb.disabled=false; rb.textContent="重开窗口"; }
+            }catch(e){ toast("重开失败："+e.message,true); rb.disabled=false; rb.textContent="重开窗口"; }
+          });
+          row.appendChild(rb);
+        }
+        const btn=mk("手动收片");
+        btn.addEventListener("click",async()=>{
+          btn.disabled=true; btn.textContent="收片中…";
+          try{
+            const r=await api("/api/dola/manual-collect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:rec.run_id,scene_no:rec.scene_no})});
+            toast(r.msg||"已触发", r.ok?false:true);
+            if(r.ok) setTimeout(loadPending, 3000); else { btn.disabled=false; btn.textContent="手动收片"; }
+          }catch(e){ toast("手动收片失败："+e.message,true); btn.disabled=false; btn.textContent="手动收片"; }
+        });
+        row.appendChild(btn); item.appendChild(row);
+      }
+      {
+        const row=document.createElement("div"); row.className="r2";
+        const db=document.createElement("button"); db.textContent="删除记录";
+        db.style.cssText="font-size:11px;padding:2px 8px;border:1px solid #c0392b;color:#c0392b;background:#fff;border-radius:4px;cursor:pointer;";
+        db.addEventListener("click",async()=>{
+          if(!confirm("删除该收片记录？对应账号（冻结/归档）将被清除。")) return;
+          db.disabled=true; db.textContent="删除中…";
+          try{
+            const r=await api("/api/dola/delete-pending",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:rec.run_id,scene_no:rec.scene_no})});
+            toast(r.msg||"已删除", r.ok?false:true);
+            loadPending();
+          }catch(e){ toast("删除失败："+e.message,true); db.disabled=false; db.textContent="删除记录"; }
+        });
+        row.appendChild(db); item.appendChild(row);
+      }
       if(rec.status==="done" && rec.path){
         const lnk=document.createElement("div"); lnk.className="r2";
         const a=document.createElement("a"); a.className="link"; a.textContent=rec.path;
@@ -1205,13 +1246,14 @@ $("#pendingBtn").addEventListener("click",()=>{
 $("#pendingClose").addEventListener("click",closePendingPanel);
 $("#pendingRefresh").addEventListener("click",loadPending);
 async function pollGen(){
+  genStopNotified=false;
   if(genPollTimer){ clearInterval(genPollTimer); genPollTimer=null; }
   genPollTimer = setInterval(async ()=>{
     if(!genRunId) return;
     try{
       const j = await api("/api/dola/status?run="+encodeURIComponent(genRunId));
       renderGen(j);
-      if(j.status==="complete" || j.status==="cancelled" || j.status==="error"){
+      if(j.status==="complete" || j.status==="cancelled" || j.status==="error" || j.status==="stopped_loggedout"){
         clearInterval(genPollTimer); genPollTimer=null;
         $("#genPanelStop").disabled=true;
         if(singleGenIdx>=0){ updateShotGenStatus(singleGenIdx, j); singleGenIdx=-1; }
@@ -1224,11 +1266,12 @@ function renderGen(j){
   if(j.error && !j.shots){ $("#genOverallText").textContent="任务异常："+j.error; return; }
   const shots = j.shots||[];
   const total = shots.length;
-  const done = (j.status==="complete" || j.status==="cancelled" || j.status==="error");
+  const done = (j.status==="complete" || j.status==="cancelled" || j.status==="error" || j.status==="stopped_loggedout");
+  if(j.stop_reason && !genStopNotified){ genStopNotified=true; showStopModal(j.stop_reason); }
   const ok_count = shots.filter(s=>s.status==="done").length;
   const fail = shots.filter(s=>["rejected","service_error","unknown","error","gate_failed","no_30s"].includes(s.status)).length;
   if(j.output_dir) genOutDirCurrent = j.output_dir;
-  const statusText = {pending:"排队中",generating:"生成中",pending_submit:"已提交",done:"已完成",rejected:"被拒绝",service_error:"服务错误",unknown:"结果未知",error:"出错",gate_failed:"无可用账号",no_30s:"无30秒能力(换号)"};
+  const statusText = {pending:"排队中",generating:"生成中",pending_submit:"已提交",done:"已完成",rejected:"被拒绝",service_error:"服务错误",unknown:"结果未知",error:"出错",gate_failed:"无可用账号",no_30s:"无30秒能力(换号)",loggedout_stop:"未登录过多已停止"};
   let overall;
   if(done){
     overall = `完成：成功 ${ok_count} · 失败 ${fail}（共 ${total}）`;
@@ -1238,7 +1281,7 @@ function renderGen(j){
   $("#genOverallText").textContent = overall;
   $("#genOverallBar").style.width = total ? (ok_count/total*100)+"%" : "0%";
   $("#genPanelOpenDir").disabled = !genOutDirCurrent;
-  $("#genPanelRetryFail").disabled = !(done && fail > 0);
+  $("#genPanelRetryFail").disabled = !(fail > 0);
   const cur = j.current;
   if(cur && cur.step){
     $("#genCurrent").textContent = "当前动作：分镜" + cur.scene_no + " — " + cur.step + (cur.instance ? "（" + cur.instance + "）" : "");
@@ -1255,6 +1298,20 @@ function renderGen(j){
     const st=document.createElement("span"); st.className="st"; st.textContent=statusText[s.status]||s.status;
     const pct=document.createElement("span"); pct.className="pct"; pct.textContent=(s.status==="done"?"100%":(s.status==="generating"?"生成中":(s.status==="pending_submit"?"已提交":"0%")));
     row.append(dot,lbl,st,pct);
+    if(["pending","pending_submit","unknown","original","error","rejected","no_30s","generating","gate_failed"].includes(s.status) && s.scene_no){
+      const mbtn=document.createElement("button");
+      mbtn.style.cssText="font-size:10.5px;padding:1px 7px;border:1px solid #888;color:#555;background:#fff;border-radius:4px;cursor:pointer;margin-left:6px;";
+      mbtn.textContent="手动收片";
+      mbtn.addEventListener("click",async()=>{
+        mbtn.disabled=true; mbtn.textContent="收片中…";
+        try{
+          const r=await api("/api/dola/manual-collect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run:genRunId,scene_no:s.scene_no})});
+          toast(r.msg||"已触发", r.ok?false:true);
+        }catch(e){ toast("手动收片失败："+e.message,true); }
+        setTimeout(()=>{ mbtn.disabled=false; mbtn.textContent="手动收片"; }, 4000);
+      });
+      row.appendChild(mbtn);
+    }
     if(s.status==="done" && s.path){
       const lnk=document.createElement("a"); lnk.className="link"; lnk.textContent="打开";
       lnk.addEventListener("click",()=>openMedia(s.path));
@@ -1278,6 +1335,20 @@ async function stopGen(){
     const j = await api("/api/dola/cancel", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({run: genRunId})});
     toast(j.ok ? "已请求停止，正在关闭窗口…" : ("停止失败："+j.error), !j.ok);
   }catch(e){ toast("停止失败："+e.message, true); btn.disabled=false; }
+}
+let genStopNotified=false;
+function showStopModal(msg){
+  const old=document.getElementById("stopModal"); if(old) old.remove();
+  const m=document.createElement("div"); m.id="stopModal";
+  m.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9999;display:flex;align-items:center;justify-content:center;";
+  const box=document.createElement("div");
+  box.style.cssText="background:#fff;border-radius:10px;padding:24px 28px;max-width:460px;width:92%;box-shadow:0 8px 30px rgba(0,0,0,.25);text-align:center;";
+  const t=document.createElement("div"); t.style.cssText="font-size:17px;font-weight:600;color:#c0392b;margin-bottom:12px;"; t.textContent="生成已停止";
+  const p=document.createElement("div"); p.style.cssText="font-size:14px;color:#333;margin-bottom:18px;white-space:pre-wrap;"; p.textContent=msg;
+  const c=document.createElement("button"); c.textContent="关闭";
+  c.style.cssText="padding:7px 22px;border:none;border-radius:6px;background:#c0392b;color:#fff;cursor:pointer;font-size:14px;";
+  c.addEventListener("click",()=>{ m.remove(); });
+  box.append(t,p,c); m.appendChild(box); document.body.appendChild(m);
 }
 async function openDir(path){
   try{ await api("/api/bridge/openfolder", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({path})}); }

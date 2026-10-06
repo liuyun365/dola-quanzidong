@@ -530,6 +530,24 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
                 send_json(self, dola_engine.cancel(body.get("run") or ""))
                 return
+            if parsed.path == "/api/dola/manual-collect":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                send_json(self, dola_engine.manual_collect(
+                    body.get("run") or "", body.get("scene_no")))
+                return
+            if parsed.path == "/api/dola/reopen":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                send_json(self, dola_engine.reopen_window(
+                    body.get("run") or "", body.get("scene_no")))
+                return
+            if parsed.path == "/api/dola/delete-pending":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                send_json(self, dola_engine.delete_pending(
+                    body.get("run") or "", body.get("scene_no")))
+                return
             if parsed.path == "/api/bridge/cancel":
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length).decode("utf-8"))

@@ -109,36 +109,59 @@ try {
     await sleep(500);
     const cards = await evaluate(`document.querySelectorAll('[class*="block-video-"]').length`);
     if (cards < 1) throw new Error(`Expected at least one video card, found ${cards}`);
-    let rows;
-    for (let pass = 0; pass < 4; pass++) {
-      rows = await evaluate(`(()=>{const r=document.getElementById('watermark-free-media-panel')?.shadowRoot;return [...(r?.querySelectorAll('.item')||[])].filter(x=>x.querySelector('.tag.video')).map(x=>({url:x.querySelector('.label')?.title,rect:x.querySelector('.dl')?.getBoundingClientRect().toJSON()}))})()`);
-      if (rows?.length) break;
-      // 卡片在但解析空：重触发解析面板，等待网速/嗅探跟上
-      await evaluate(`(async()=>{const r=document.getElementById('watermark-free-media-panel')?.shadowRoot;const e=r?.querySelector('.parse-panel-toggle');if(e){if(e.checked)e.click();await new Promise(x=>setTimeout(x,400));if(!e.checked)e.click();}return true})()`);
+    const sniffRows = () => evaluate(`(()=>{const r=document.getElementById('watermark-free-media-panel')?.shadowRoot;return [...(r?.querySelectorAll('.item')||[])].filter(x=>x.querySelector('.tag.video')).map(x=>({url:x.querySelector('.label')?.title,rect:x.querySelector('.dl')?.getBoundingClientRect().toJSON()}))})()`);
+    const triggerParse = () => evaluate(`(async()=>{const r=document.getElementById('watermark-free-media-panel')?.shadowRoot;const e=r?.querySelector('.parse-panel-toggle');if(e){if(e.checked)e.click();await new Promise(x=>setTimeout(x,400));if(!e.checked)e.click();}return true})()`);
+    const hoverCardAndSniff = async () => {
       let videoRect;
       for (let i = 0; i < 30 && !videoRect; i++) {
         videoRect = await evaluate(`document.querySelector('[class*="block-video-"]')?.getBoundingClientRect().toJSON()`);
         if (!videoRect) await sleep(500);
       }
-      if (!videoRect) {
-        rows = await evaluate(`(()=>{const r=document.getElementById('watermark-free-media-panel')?.shadowRoot;return [...(r?.querySelectorAll('.item')||[])].filter(x=>x.querySelector('.tag.video')).map(x=>({url:x.querySelector('.label')?.title,rect:x.querySelector('.dl')?.getBoundingClientRect().toJSON()}))})()`);
-        if (rows?.length) break;
-        await sleep(3000);
-        continue;
-      }
+      if (!videoRect) return null;
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved',
         x: videoRect.x + videoRect.width / 2, y: videoRect.y + videoRect.height / 2 });
+      let rows;
       for (let i = 0; i < 60; i++) {
-        rows = await evaluate(`(()=>{const r=document.getElementById('watermark-free-media-panel')?.shadowRoot;return [...(r?.querySelectorAll('.item')||[])].filter(x=>x.querySelector('.tag.video')).map(x=>({url:x.querySelector('.label')?.title,rect:x.querySelector('.dl')?.getBoundingClientRect().toJSON()}))})()`);
+        rows = await sniffRows();
         if (rows?.length) break;
         await sleep(500);
       }
+      return rows;
+    };
+    let rows;
+    for (let pass = 0; pass < 4; pass++) {
+      rows = await sniffRows();
       if (rows?.length) break;
+      await triggerParse();
+      rows = await hoverCardAndSniff();
+      if (rows?.length) break;
+      await sleep(3000);
+    }
+    // 生成了片子但嗅探不到无水印资源：先刷新一遍网页，再等成片重新出现并重新嗅探下载
+    if (!rows?.length) {
+      await evaluate('location.reload()');
+      let reComplete = false;
+      for (let i = 0; i < 60 && !reComplete; i++) {
+        await sleep(1000);
+        reComplete = await evaluate(`(document.body?.innerText||'').includes('你的视频生成好了') || !!document.querySelector('[class*="block-video-"]')`);
+      }
+      if (reComplete) {
+        await sleep(1500);
+        await evaluate(`(()=>{const r=document.getElementById('watermark-free-media-panel')?.shadowRoot;const e=r?.querySelector('.parse-panel-toggle');if(e&&!e.checked)e.click();return !!r})()`);
+        await sleep(500);
+        for (let pass = 0; pass < 4 && !rows?.length; pass++) {
+          rows = await sniffRows();
+          if (rows?.length) break;
+          await triggerParse();
+          rows = await hoverCardAndSniff();
+          if (rows?.length) break;
+          await sleep(3000);
+        }
+      }
     }
     if (!rows?.length) {
       throw new Error('No parsed video found after extended sniffing; preserve chat for recovery');
     }
-    if (!rows?.length) throw new Error(`No parsed video found`);
     const media = new URL(rows[rows.length - 1].url); // 取最新解析的无水印资源
     if (!media.hostname.endsWith('dola.com') || media.searchParams.get('mime_type') !== 'video_mp4') {
       throw new Error('Parsed resource is not a Dola MP4 video');

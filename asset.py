@@ -161,25 +161,33 @@ def parse_shot_assets(text):
     return items
 
 
-def _parse_ref_items(line):
-    """从「**参考对应：**」行解析出精确的 slot→文件 资产列表（图一、图二… 顺序）。
+def _parse_ref_items(text):
+    """从「**参考对应：**」解析出精确的 slot→文件 资产列表（图一、图二… 顺序）。
 
     参考对应是完整准确的（每图一个确切文件），作为本标准的首选解析来源。
-    形如：图一对应F02 人物设定/女主_小三形象_v1.png；图二对应F12 人物设定/丈夫_约会形象_v1.png；
-    「无独立参考图 / 无参考图」的槽位跳过（不留资产，保持留白）。
+    支持两种排版：
+    1) 同行分号：图一对应F02 人物设定/女主_小三形象_v1.png；图二对应F12 人物设定/丈夫_约会形象_v1.png；
+    2) 多行逐条：图一＝F04｜人物设定/女主_外出吃饭便装_v1.png
+                 图二＝F21｜人物设定/闺蜜_火锅休闲形象_v1.png
+    「无独立参考图 / 无参考图」槽位跳过（留白）。
     """
     items = []
-    for seg in re.split(r"[；;。]", line):
-        seg = seg.strip()
-        if not seg:
-            continue
-        m = re.search(r"图\s*([一二三四五六七八九十0-9]+)\s*对应\s*(.*)", seg)
+    segs = []
+    for line in re.split(r"[\r\n]+", text):
+        for seg in re.split(r"[；;。]", line):
+            seg = seg.strip()
+            if seg:
+                segs.append(seg)
+    for seg in segs:
+        m = re.search(r"图\s*([一二三四五六七八九十0-9]+)\s*(?:对应|＝|=|→|:)\s*(.*)", seg)
         if not m:
             continue
         slotn = _slot_number("图" + m.group(1))
         rest = m.group(2).strip()
         if any(k in rest for k in ("无独立参考图", "无参考图", "无对应", "无独立")):
             continue  # 该槽无参考图文件，留白
+        # 去掉前缀编号标记：F04｜ / F02  / 02
+        rest = re.sub(r"^(?:[A-Za-z]?\d+\s*[｜|]\s*|[A-Za-z]?\d+\s+)", "", rest).strip()
         fn = rest.replace("\\", "/").rsplit("/", 1)[-1]
         fn = re.split(r"[（(]", fn)[0].strip()
         if not fn:
@@ -203,6 +211,7 @@ def parse_file_assets(path):
 
     分镜归属：遇到「角色映射/场景映射」行，归到它之前最近一个 ### 开头的分镜。
     只保留含资产声明的分镜（与前端按 ### 识别的真实分镜顺序一致）。
+    「参考对应」支持同行分号与多行逐条两种排版（多行：标题行后逐条「图N对应/图N＝…」）。
     """
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -210,28 +219,50 @@ def parse_file_assets(path):
     idx_by_label = {}
     cur_key = None
     used_ref_by_key = {}
-    for ln in text.split("\n"):
-        s = ln.strip()
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
         if s.startswith("###"):
             cur_key = s
             if cur_key not in idx_by_label:
                 idx_by_label[cur_key] = len(shots_ordered)
                 shots_ordered.append({"label": s, "items": []})
+            i += 1
             continue
         if not cur_key:
+            i += 1
             continue
         if "参考对应" in s:
-            ri = _parse_ref_items(s)
+            block = s
+            j = i + 1
+            # 多行排版：标题行后逐条「图N对应/图N＝…」，收集到下一个 ### / 空行 / 其他映射标题为止
+            while j < len(lines):
+                ns = lines[j].strip()
+                if not ns or ns.startswith("###"):
+                    break
+                if any(k in ns for k in ("**角色映射", "**场景映射", "**物品映射",
+                                         "**声线参考", "**初始站位", "**生成规格", "**时间轴")):
+                    break
+                if re.search(r"图\s*[一二三四五六七八九十0-9]+\s*(?:对应|＝|=|→|:)", ns):
+                    block += "\n" + ns
+                    j += 1
+                else:
+                    break
+            ri = _parse_ref_items(block)
             if ri:
                 shots_ordered[idx_by_label[cur_key]]["items"] = ri
                 used_ref_by_key[cur_key] = True
+            i = j
             continue
         if used_ref_by_key.get(cur_key):
-            continue  # 本分镜已用「参考对应」精确解析（完整准确），跳过名字映射
+            i += 1
+            continue
         if "角色映射" in s or "场景映射" in s:
             items = parse_shot_assets(s)
             if items:
                 shots_ordered[idx_by_label[cur_key]]["items"].extend(items)
+        i += 1
     for sh in shots_ordered:
         sh["items"].sort(key=lambda x: x["slotn"])
     real = [sh for sh in shots_ordered if sh["items"]]

@@ -17,6 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+import socket
 
 import pool
 import proxy as proxy_pool
@@ -32,9 +33,21 @@ def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _find_node() -> str:
+    """优先系统安装的 Node 绝对路径（避免 PATH 里没有 node 时 WinError 2）；找不到再退回 PATH。"""
+    for cand in (r"C:\Program Files\nodejs\node.exe",
+                 r"C:\Program Files (x86)\nodejs\node.exe"):
+        if os.path.isfile(cand):
+            return cand
+    return "node"
+
+
+NODE_BIN = os.environ.get("DOLA_NODE") or _find_node()
+
+
 def _run_node(script: str, args: list, stdin_json=None, timeout: int = 240):
     """spawn 一个 Node CDP 脚本，stdin 传 JSON（如账号凭据），返回 stdout JSON。"""
-    cmd = ["node", str(TOOLS / script), *[str(a) for a in args]]
+    cmd = [NODE_BIN, str(TOOLS / script), *[str(a) for a in args]]
     p = subprocess.Popen(
         cmd, cwd=str(TOOLS),
         stdin=subprocess.PIPE if stdin_json is not None else None,
@@ -114,6 +127,16 @@ def _submit(port: int, manifest: Path):
 
 def _observe(port: int):
     return _run_node("observe_scene.mjs", [port], timeout=60)
+
+
+def _window_alive(port) -> bool:
+    """检测 CDP 调试端口是否仍在监听（浏览器窗口未关闭）。直连端口，不走代理。"""
+    try:
+        s = socket.create_connection(("127.0.0.1", int(port)), timeout=3)
+        s.close()
+        return True
+    except Exception:
+        return False
 
 
 def _wait_completed(port: int, chat_url: str, cancel_ev=None, max_wait: float = 900):
@@ -212,6 +235,20 @@ def _wait_acceptance(port: int, initial_tail: str, timeout: float = 60):
     return "sent_outcome_unknown", tail
 
 
+# 未登录/需同意 Cookie 等特征：这类不视为失败、不占重试额度，直接换号重试
+_LOGGED_OUT_MARKERS = ("Cookie", "请确认并同意", "确认并同意", "登录即代表", "注册 登录",
+                       "同意并继续", "使用 Cookie 与类似技术", "请同意", "同意使用我们的")
+
+
+def _looks_logged_out(tail: str) -> bool:
+    t = tail or ""
+    return any(m in t for m in _LOGGED_OUT_MARKERS)
+
+
+# 连续未登录达到该上限即停止整个任务生成（仅针对未登录情况）
+_LOGGED_OUT_LIMIT = 10
+
+
 # ---------------------------------------------------------------- 长效收片记录
 # 提交成功(accepted_generating)的分镜立即入队，收片(等出片/下载/归档)走独立线程，
 # 记录持久化到磁盘，后端重启/刷新页面后也能恢复，避免切换剧本丢失在途视频。
@@ -249,92 +286,93 @@ def _upsert_pending(rec) -> list:
     return recs
 
 
+_REJECT_MARKERS = (
+    "未认证人脸", "额度不足", "生成失败", "出了点问题", "肖像", "版权", "侵权",
+    "涉嫌违规", "违规内容", "无法生成", "内容不合规", "审核未通过", "被驳回",
+    "额度未扣除", "服务繁忙",
+)
+_WAIT_POLL = 1200  # 未出片 / 无水印嗅探的轮询间隔（秒）：20 分钟
+
+
 def _collect_pending(rec, cancel_ev=None):
-    """收片：等待出片→下载→归档→更新长效记录。独立线程可复用（含后端重启恢复）。"""
+    """收片：无限等待出片→下载→归档→更新长效记录。
+    收片时长不限、窗口保留；只要未出现明确失败文案（肖像/错误/版权/违规等）都不视为失败、不重试。
+    未出片（仍在生成）持续等待；「无水印失败已下载原片」后每 20 分钟再嗅探一次无水印，成功则下载并置完成。
+    独立线程可复用（含后端重启恢复）。
+    """
     port = rec.get("port")
     chat_url = rec.get("chat_url") or ""
     account_email = rec.get("account")
     scene_no = rec.get("scene_no")
     series = rec.get("series") or ""
+    out_dir = rec.get("output_dir") or "."
+    os.makedirs(out_dir, exist_ok=True)
     try:
-        obs = _wait_completed(port, chat_url, cancel_ev, max_wait=3000)
-        if obs.get("cancelled"):
-            rec["status"] = "cancelled"
-            try:
-                _close_failed(port)
-            except Exception:
-                pass
-            _upsert_pending(rec)
+        if rec.get("status") == "original":
+            _retry_watermark(rec, port, chat_url, cancel_ev)
             return rec
-        if obs.get("no_30s"):
-            rec["status"] = "no_30s"
-            rec["error"] = "收片时账号无30s能力"
-            try:
-                _close_failed(port)
-            except Exception:
-                pass
-            if account_email:
-                pool.delete_account(account_email)
-            _upsert_pending(rec)
-            return rec
-        tail2 = obs.get("tail", "") or ""
-        if obs.get("rejected"):
-            # 提交后二次审核拒绝（肖像/版权/违规等）：视为失败，关窗删号
-            rec["status"] = "rejected"
-            rec["error"] = "收片被拒绝（肖像/版权/违规等）：" + tail2[-200:]
-            try:
-                _close_failed(port)
-            except Exception:
-                pass
-            if account_email:
-                pool.delete_account(account_email)
-            _upsert_pending(rec)
-            return rec
-        if obs.get("videoCards", 0) > 0 or "你的视频生成好了" in tail2:
-            out_dir = rec.get("output_dir") or "."
-            os.makedirs(out_dir, exist_ok=True)
-            dest = os.path.join(out_dir, _video_name(out_dir, series, scene_no))
-            try:
-                dl = _download(port, dest, chat_url)
-                rec["path"] = dl.get("file")
-                rec["verify"] = {
-                    "bytes": dl.get("bytes"), "duration": dl.get("duration_seconds"),
-                    "sha256": dl.get("sha256"),
-                }
+        while True:
+            if cancel_ev and cancel_ev.is_set():
+                rec["status"] = "cancelled"
                 try:
-                    _close(port, chat_url, dest)
+                    _close_failed(port)
                 except Exception:
-                    try:
-                        _close_failed(port)  # done 后兜底关窗，避免成功页面残留
-                    except Exception:
-                        pass
-                rec["status"] = "done"
-                rec["error"] = None
-                if account_email:
-                    pool.set_status(account_email, "generated", "ok",
-                                    series=series, scene=str(scene_no))
-            except Exception as dl_e:
-                # 有视频但无水印收片失败：不重新生成、不关窗；尝试下载原片(前缀"原片"标注)，保留页面待查看
-                try:
-                    orig = os.path.join(out_dir, _video_name_original(out_dir, series, scene_no))
-                    odl = _download_original(port, orig, chat_url)
-                    rec["path"] = odl.get("file")
-                    rec["status"] = "original"
-                    rec["error"] = "无水印收片失败，已下载原片待查看：" + str(dl_e)[:120]
-                except Exception as oe:
-                    rec["status"] = "keep_window"
-                    rec["error"] = "有视频但无水印/原片收片均失败，窗口已保留待查看：" + str(dl_e)[:120] + " / " + str(oe)[:100]
+                    pass
                 _upsert_pending(rec)
                 return rec
-        else:
-            rec["status"] = "unknown"
-            rec["error"] = "收片未检测到成片：" + tail2[-200:]
+            if not _window_alive(port):
+                # 窗口被手动关闭：任务暂停、账号临时冻结，等待用户在收片记录重开窗口
+                rec["status"] = "window_closed"
+                rec["error"] = "窗口被手动关闭，任务已暂停，账号已临时冻结，可在收片记录重新打开窗口"
+                try:
+                    _close_failed(port)
+                except Exception:
+                    pass
+                if account_email:
+                    pool.set_status(account_email, "frozen", "窗口被手动关闭")
+                _upsert_pending(rec)
+                return rec
             try:
-                _close_failed(port)
-            except Exception:
-                pass
-            if account_email:
-                pool.delete_account(account_email)
+                obs = _observe(port)
+            except Exception as e:
+                if not _window_alive(port):
+                    rec["status"] = "window_closed"
+                    rec["error"] = "窗口被手动关闭，任务已暂停，账号已临时冻结，可在收片记录重新打开窗口"
+                    try:
+                        _close_failed(port)
+                    except Exception:
+                        pass
+                    if account_email:
+                        pool.set_status(account_email, "frozen", "窗口被手动关闭")
+                    _upsert_pending(rec)
+                    return rec
+                obs = {"tail": "", "videoCards": 0, "error": str(e)[:100]}
+            tail = obs.get("tail", "") or ""
+            if any(t in tail for t in _REJECT_MARKERS):
+                rec["status"] = "rejected"
+                rec["error"] = "收片被拒绝（肖像/版权/违规等）：" + tail[-200:]
+                try:
+                    _close_failed(port)
+                except Exception:
+                    pass
+                if account_email:
+                    pool.delete_account(account_email)
+                _upsert_pending(rec)
+                return rec
+            if classify(tail) == "no_30s":
+                rec["status"] = "no_30s"
+                rec["error"] = "收片时账号无30s能力"
+                try:
+                    _close_failed(port)
+                except Exception:
+                    pass
+                if account_email:
+                    pool.delete_account(account_email)
+                _upsert_pending(rec)
+                return rec
+            if obs.get("videoCards", 0) > 0 or "你的视频生成好了" in tail:
+                return _try_collect(rec, port, chat_url, cancel_ev)
+            time.sleep(_WAIT_POLL)
     except Exception as e:
         try:
             _close_failed(port)
@@ -346,11 +384,82 @@ def _collect_pending(rec, cancel_ev=None):
     return rec
 
 
+def _try_collect(rec, port, chat_url, cancel_ev):
+    """有成片：优先无水印下载→done；无水印失败→下载原片(original)→周期再嗅探无水印。"""
+    scene_no = rec.get("scene_no")
+    series = rec.get("series") or ""
+    out_dir = rec.get("output_dir") or "."
+    dest = os.path.join(out_dir, _video_name(out_dir, series, scene_no))
+    try:
+        dl = _download(port, dest, chat_url)
+        rec["path"] = dl.get("file")
+        rec["verify"] = {"bytes": dl.get("bytes"), "duration": dl.get("duration_seconds"),
+                         "sha256": dl.get("sha256")}
+        try:
+            _close(port, chat_url, dest)
+        except Exception:
+            _close_failed(port)
+        rec["status"] = "done"
+        rec["error"] = None
+        if rec.get("account"):
+            pool.set_status(rec["account"], "generated", "ok", series=series, scene=str(scene_no))
+        _upsert_pending(rec)
+    except Exception as dl_e:
+        try:
+            orig = os.path.join(out_dir, _video_name_original(out_dir, series, scene_no))
+            odl = _download_original(port, orig, chat_url)
+            rec["path"] = odl.get("file")
+            rec["status"] = "original"
+            rec["error"] = "无水印收片失败，已下载原片待查看：" + str(dl_e)[:120]
+            _upsert_pending(rec)
+            _retry_watermark(rec, port, chat_url, cancel_ev)
+        except Exception as oe:
+            rec["status"] = "keep_window"
+            rec["error"] = "有视频但无水印/原片收片均失败，窗口已保留待查看：" + str(dl_e)[:120] + " / " + str(oe)[:100]
+            _upsert_pending(rec)
+    return rec
+
+
+def _retry_watermark(rec, port, chat_url, cancel_ev):
+    """「无水印失败已下载原片」后：每 20 分钟嗅探一次无水印，嗅探到则下载并置完成。"""
+    scene_no = rec.get("scene_no")
+    series = rec.get("series") or ""
+    out_dir = rec.get("output_dir") or "."
+    while True:
+        if cancel_ev and cancel_ev.is_set():
+            rec["status"] = "cancelled"
+            try:
+                _close_failed(port)
+            except Exception:
+                pass
+            _upsert_pending(rec)
+            return
+        time.sleep(_WAIT_POLL)
+        try:
+            dest = os.path.join(out_dir, _video_name(out_dir, series, scene_no))
+            dl = _download(port, dest, chat_url)
+            rec["path"] = dl.get("file")
+            rec["verify"] = {"bytes": dl.get("bytes"), "duration": dl.get("duration_seconds"),
+                             "sha256": dl.get("sha256")}
+            try:
+                _close(port, chat_url, dest)
+            except Exception:
+                _close_failed(port)
+            rec["status"] = "done"
+            rec["error"] = None
+            if rec.get("account"):
+                pool.set_status(rec["account"], "generated", "ok", series=series, scene=str(scene_no))
+            _upsert_pending(rec)
+            return
+        except Exception:
+            continue  # 仍嗅探不到无水印：继续每 20 分钟重试
+
+
 def resume_pending():
     """后端启动/刷新后恢复未完成收片（在途实例仍在 Dola 后台生成）。"""
     started = 0
     for rec in _load_pending():
-        if rec.get("status") in ("pending", "unknown"):
+        if rec.get("status") in ("pending", "unknown", "original"):
             threading.Thread(target=_collect_pending, args=(rec,), daemon=True).start()
             started += 1
     return started
@@ -359,6 +468,107 @@ def resume_pending():
 def list_pending():
     """返回全部长效收片记录（含历史，前端可查看）。"""
     return _load_pending()
+
+
+def manual_collect(run_id: str, scene_no):
+    """手动收片：对某条收片记录重新触发「检查成片→下载→归档」。
+    用于视频已在 Dola 后台生成但自动收片未及时触发的场景。"""
+    rec = None
+    for r in _load_pending():
+        if r.get("run_id") == run_id and r.get("scene_no") == scene_no:
+            rec = r
+            break
+    if not rec:
+        return {"ok": False, "msg": "未找到该镜头的收片记录"}
+    cur = rec.get("status")
+    if cur == "done":
+        return {"ok": False, "msg": "该镜头已收片完成"}
+    if cur == "cancelled":
+        return {"ok": False, "msg": "该镜头已取消，无法收片"}
+    rec["status"] = "pending"
+    rec["error"] = None
+    threading.Thread(target=_collect_pending, args=(rec,), daemon=True).start()
+    return {"ok": True, "msg": f"已对镜头{scene_no}触发手动收片（原状态 {cur}），请稍后在收片记录查看"}
+
+
+def reopen_window(run_id: str, scene_no):
+    """收片记录里重新打开已关闭窗口（同一账号），并恢复该镜头收片（检测/收片）。
+    适用于窗口被手动关闭后（状态 window_closed）的恢复。"""
+    rec = None
+    for r in _load_pending():
+        if r.get("run_id") == run_id and r.get("scene_no") == scene_no:
+            rec = r
+            break
+    if not rec:
+        return {"ok": False, "msg": "未找到该镜头的收片记录"}
+    email = rec.get("account")
+    if not email:
+        return {"ok": False, "msg": "该记录缺少账号"}
+    account = pool.load_account(email)
+    if not account:
+        return {"ok": False, "msg": "账号凭据不存在，无法重开"}
+    profile_key = rec.get("profile_key") or f"reopen_{run_id}_{scene_no}_{int(time.time())}"
+    proxy = account.get("proxy") or "http://127.0.0.1:7897"
+    params = {"proxy": proxy, "visible": True}
+    try:
+        b = _launch_browser(account, params, profile_key, chat_url=rec.get("chat_url") or "")
+    except Exception as e:
+        return {"ok": False, "msg": "重开窗口失败：" + str(e)[:120]}
+    port = int(b.get("port") or 0)
+    login = b.get("login_state")
+    if login != "ok":
+        try:
+            obs = _observe(port)
+            ptext = obs.get("tail", "") or ""
+            if any(k in ptext for k in ("登录以解锁更多功能", "Google 登录", "登录即代表你同意", "注册 登录")):
+                login = "needs_review"
+        except Exception:
+            pass
+    if login in ("logged_out", "needs_review") or not b.get("extension_loaded"):
+        try:
+            _close_failed(port)
+        except Exception:
+            pass
+        return {"ok": False, "msg": f"重开窗口后未正常登录（{login}），已关闭，请换号或手动确认"}
+    rec["port"] = port
+    rec["chat_url"] = b.get("url") or rec.get("chat_url") or ""
+    rec["status"] = "pending"
+    rec["error"] = None
+    _upsert_pending(rec)
+    # 解冻账号（窗口被关时的临时冻结 → 恢复），继续用于该镜头收片
+    try:
+        pool.set_status(email, "registered", "重开窗口恢复收片")
+    except Exception:
+        pass
+    threading.Thread(target=_collect_pending, args=(rec,), daemon=True).start()
+    return {"ok": True, "msg": f"已用同一账号重开窗口并恢复镜头{scene_no}收片，请稍候查看"}
+
+
+def delete_pending(run_id: str, scene_no):
+    """手动删除收片记录：关闭对应窗口并清除该账号（含临时冻结/已归档）。"""
+    recs = _load_pending()
+    target = None
+    for r in recs:
+        if r.get("run_id") == run_id and r.get("scene_no") == scene_no:
+            target = r
+            break
+    if not target:
+        return {"ok": False, "msg": "未找到该镜头的收片记录"}
+    email = target.get("account")
+    port = target.get("port")
+    try:
+        if port:
+            _close_failed(port)
+    except Exception:
+        pass
+    if email:
+        try:
+            pool.delete_account(email)
+        except Exception:
+            pass
+    new = [r for r in recs if not (r.get("run_id") == run_id and r.get("scene_no") == scene_no)]
+    _save_pending(new)
+    return {"ok": True, "msg": f"已删除收片记录并清除账号 {email}"}
 
 
 # ---------------------------------------------------------------- 批量调度
@@ -444,6 +654,14 @@ def _process_shot(run_id: str, shot: dict, assets: list, out_dir: str,
         result["status"] = "no_30s"
         result["error"] = "账号无法使用30秒2.5（仅10秒），已关闭重开换号"
 
+    def _reset_logged_out():
+        # 非未登录情况（成功提交/被拒/服务错误/无30s/异常）中断"连续未登录"计数
+        with ledger_lock:
+            if ledger.get("logged_out_streak"):
+                ledger["logged_out_streak"] = 0
+                _p = RUNS / f"{run_id}.json"
+                _p.write_text(json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
+
     if _cancelled():
         result["status"] = "cancelled"
         return result
@@ -495,7 +713,7 @@ def _process_shot(run_id: str, shot: dict, assets: list, out_dir: str,
             result["attempt"] = attempts_used + 1
             port = None
             chat_url = ""
-            profile_key = f"{run_id}_{result['scene_no']}_t{attempts_used}"
+            profile_key = f"{run_id}_{result['scene_no']}_t{attempts_used}_{int(time.time()*1000)}_{os.urandom(2).hex()}"
             _set_step("启动浏览器", account["email"])
             try:
                 b = _launch_browser(account, params, profile_key)
@@ -566,11 +784,13 @@ def _process_shot(run_id: str, shot: dict, assets: list, out_dir: str,
                 port = None
                 pool.delete_account(account["email"])  # 无30s能力，号丢弃
                 _no_30s()
+                _reset_logged_out()
                 _note("no_30s(受理文案) " + tail[-80:])
                 last_err = result["error"]
                 continue  # 不占额度
             if outcome == "accepted_generating":
                 # 提交确认即通过：立即返回，窗口保留在后台等出片，worker 继续提交下一个分镜，不阻塞
+                _reset_logged_out()
                 result["status"] = "pending_submit"
                 result["port"] = port
                 result["chat_url"] = chat_url
@@ -593,6 +813,7 @@ def _process_shot(run_id: str, shot: dict, assets: list, out_dir: str,
                 _close_failed(port)
                 port = None
                 pool.delete_account(account["email"])  # 失败（含肖像/版权等），号丢弃
+                _reset_logged_out()
                 if outcome == "rejected":
                     result["status"] = "rejected"
                     result["error"] = "被拒绝（肖像/版权等）：" + tail[-160:]
@@ -600,6 +821,27 @@ def _process_shot(run_id: str, shot: dict, assets: list, out_dir: str,
                     result["status"] = "service_error"
                     result["error"] = "平台服务错误：" + tail[-160:]
                 else:
+                    if _looks_logged_out(tail):
+                        # 未登录/需同意Cookie：不占失败次数，直接换号重试（符合既定规则）
+                        # 连续累计：达到上限即停止整个任务生成并告知前端弹窗
+                        with ledger_lock:
+                            ledger["logged_out_streak"] = ledger.get("logged_out_streak", 0) + 1
+                            if ledger["logged_out_streak"] >= _LOGGED_OUT_LIMIT:
+                                ledger["logged_out_stop"] = True
+                                ledger["stop_reason"] = ("连续 %d 条未登录，已停止本任务生成"
+                                                         % _LOGGED_OUT_LIMIT)
+                            _p = RUNS / f"{run_id}.json"
+                            _p.write_text(json.dumps(ledger, ensure_ascii=False, indent=2),
+                                          encoding="utf-8")
+                        if ledger.get("logged_out_stop"):
+                            if cancel_ev:
+                                cancel_ev.set()
+                            result["status"] = "loggedout_stop"
+                            result["error"] = ledger.get("stop_reason", "连续未登录过多，已停止")
+                            return result
+                        _note("未登录(需同意Cookie) 换号重试 " + tail[-80:])
+                        last_err = None
+                        continue
                     result["status"] = "unknown"
                     result["error"] = "受理结果未知：" + tail[-160:]
                 _note(outcome + " " + tail[-120:])
@@ -627,6 +869,7 @@ def _process_shot(run_id: str, shot: dict, assets: list, out_dir: str,
                     pass
                 port = None
             pool.delete_account(account["email"])  # 生成异常，号丢弃
+            _reset_logged_out()
             result["status"] = "error"
             result["error"] = str(e)[:300]
             _note("异常 " + str(e)[:150])
@@ -689,12 +932,13 @@ def _worker(run_id: str, shots: list, output_dir: str, params: dict, cancel_ev=N
     try:
         # 提交阶段（串行）：逐个分镜，提交确认(accepted_generating)即通过，立即继续下一个，不等出片
         pending = []
-        preopen_state = {"info": None, "ready": False, "lock": threading.Lock()}
+        preopen_state = {"info": None, "ready": False, "obsolete": False, "lock": threading.Lock()}
 
         def _start_preopen():
             with preopen_state["lock"]:
                 preopen_state["info"] = None
                 preopen_state["ready"] = False
+                preopen_state["obsolete"] = False
 
             def _work():
                 try:
@@ -702,8 +946,24 @@ def _worker(run_id: str, shots: list, output_dir: str, params: dict, cancel_ev=N
                 except Exception:
                     info = None
                 with preopen_state["lock"]:
-                    preopen_state["info"] = info
-                    preopen_state["ready"] = True
+                    if preopen_state.get("obsolete"):
+                        # 该预开窗口已作废（当前分镜已正常开窗提交）：关闭并释放账号，避免多余实例
+                        if info and info.get("port"):
+                            try:
+                                _close_failed(info["port"])
+                            except Exception:
+                                pass
+                            acc = info.get("account")
+                            if acc and acc.get("email"):
+                                try:
+                                    pool.release_available(acc["email"])
+                                except Exception:
+                                    pass
+                        preopen_state["info"] = None
+                        preopen_state["ready"] = False
+                    else:
+                        preopen_state["info"] = info
+                        preopen_state["ready"] = True
 
             threading.Thread(target=_work, daemon=True).start()
 
@@ -717,6 +977,10 @@ def _worker(run_id: str, shots: list, output_dir: str, params: dict, cancel_ev=N
                     pre = preopen_state["info"]
                     preopen_state["ready"] = False
                     preopen_state["info"] = None
+                    preopen_state["obsolete"] = False
+                else:
+                    # 上轮预开未就绪：当前分镜将正常开窗，标记该预开作废（就绪后关闭释放）
+                    preopen_state["obsolete"] = True
             res = _run_one(idx, shot, pre)
             if res.get("status") == "pending_submit":
                 pending.append(res)
@@ -771,7 +1035,10 @@ def _worker(run_id: str, shots: list, output_dir: str, params: dict, cancel_ev=N
                 threads.append(t)
             for t in threads:
                 t.join()
-        ledger["status"] = "cancelled" if (cancel_ev and cancel_ev.is_set()) else "complete"
+        if ledger.get("logged_out_stop"):
+            ledger["status"] = "stopped_loggedout"
+        else:
+            ledger["status"] = "cancelled" if (cancel_ev and cancel_ev.is_set()) else "complete"
     except Exception as e:
         ledger["status"] = "error"
         ledger["error"] = str(e)[:300]

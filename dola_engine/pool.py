@@ -52,6 +52,7 @@ STATUS_BAD = ("bad", "bad_used", "号废了", "废")
 STATUS_USED = ("used", "已用")
 STATUS_GENERATED = ("generated", "已生成")   # 已用并成功生成（一镜一号）
 STATUS_REVIEW = ("needs_review", "待复核")    # 登录态待复核（不参与取号，可恢复）
+STATUS_FROZEN = ("frozen", "临时冻结")        # 窗口被手动关闭时临时冻结（不参与取号，可恢复）
 
 POOL_MIN = 5
 POOL_MAX = 20
