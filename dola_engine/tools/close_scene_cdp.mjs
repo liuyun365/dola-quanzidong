@@ -12,7 +12,8 @@ if (!existsSync(videoFile) || statSync(videoFile).size < 1024 * 1024 ||
   throw new Error('Verified MP4 is missing');
 }
 const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-if (!targets.some(t => t.type === 'page' && t.url === expectedChat)) {
+// chat_url 记录为通用前缀（https://www.dola.com/chat/），实际窗口 URL 带具体对话 ID，故用前缀匹配。
+if (!targets.some(t => t.type === 'page' && t.url.startsWith(expectedChat))) {
   throw new Error('CDP browser is not on the expected conversation');
 }
 const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();

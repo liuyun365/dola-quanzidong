@@ -291,7 +291,8 @@ _REJECT_MARKERS = (
     "涉嫌违规", "违规内容", "无法生成", "内容不合规", "审核未通过", "被驳回",
     "额度未扣除", "服务繁忙",
 )
-_WAIT_POLL = 1200  # 未出片 / 无水印嗅探的轮询间隔（秒）：20 分钟
+_WAIT_POLL = 1200  # 无水印收片失败后的二次嗅探间隔（秒）：20 分钟
+_DETECT_POLL = 30  # 主循环检测出片轮询间隔（秒）：视频生成完成即及时收到，避免等满 20 分钟
 
 
 def _collect_pending(rec, cancel_ev=None):
@@ -372,7 +373,7 @@ def _collect_pending(rec, cancel_ev=None):
                 return rec
             if obs.get("videoCards", 0) > 0 or "你的视频生成好了" in tail:
                 return _try_collect(rec, port, chat_url, cancel_ev)
-            time.sleep(_WAIT_POLL)
+            time.sleep(_DETECT_POLL)
     except Exception as e:
         try:
             _close_failed(port)
